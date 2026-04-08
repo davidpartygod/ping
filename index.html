@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0A0A0F">
+<meta name="description" content="Ping — Decentralized P2P encrypted messaging.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%2300D4AA'/><circle cx='50' cy='50' r='18' fill='%230A0A0F'/></svg>">
+<title>Ping</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body,#app{height:100%;width:100%;overflow:hidden}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,'Helvetica Neue',sans-serif;background:#0A0A0F;color:#E8E8F0}
+input,textarea,button{font-family:inherit}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2A2A3A;border-radius:3px}
+@supports(padding:max(0px)){.safe-b{padding-bottom:max(12px,env(safe-area-inset-bottom))}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
+.fade-up{animation:fadeUp .4s ease both}
+.pulse{animation:pulse 1.5s ease-in-out infinite}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const el=React.createElement,{useState:S,useEffect:E,useRef:R,useCallback:CB}=React;
+const MO=`'SF Mono','Fira Code','Courier New',monospace`;
+const C={bg:"#0A0A0F",bg2:"#111118",bg3:"#1A1A25",bg4:"#222233",bd:"#2A2A3A",ac:"#00D4AA",acd:"#00D4AA20",acm:"#00D4AA55",tx:"#E8E8F0",t2:"#8888A0",t3:"#55556A",dn:"#FF4466",wr:"#FFaa33",on:"#00D4AA",off:"#55556A"};
+
+/* ═══ IndexedDB ═══ */
+const DB_N="ping_db",DB_V=2;
+function odb(){return new Promise((ok,no)=>{const r=indexedDB.open(DB_N,DB_V);r.onupgradeneeded=e=>{const d=e.target.result;["user","contacts","messages"].forEach(s=>{if(!d.objectStoreNames.contains(s))d.createObjectStore(s,{keyPath:"id"})})};r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)})}
+const D={
+  async put(s,d){const db=await odb();return new Promise((ok,no)=>{const t=db.transaction(s,"readwrite");t.objectStore(s).put(d);t.oncomplete=()=>ok();t.onerror=()=>no(t.error)})},
+  async get(s,k){const db=await odb();return new Promise((ok,no)=>{const t=db.transaction(s,"readonly");const r=t.objectStore(s).get(k);r.onsuccess=()=>ok(r.result||null);r.onerror=()=>no(r.error)})},
+  async all(s){const db=await odb();return new Promise((ok,no)=>{const t=db.transaction(s,"readonly");const r=t.objectStore(s).getAll();r.onsuccess=()=>ok(r.result||[]);r.onerror=()=>no(r.error)})},
+  async clr(s){const db=await odb();return new Promise((ok,no)=>{const t=db.transaction(s,"readwrite");t.objectStore(s).clear();t.oncomplete=()=>ok();t.onerror=()=>no(t.error)})},
+  async saveUser(u){await this.put("user",{id:"me",...u})},
+  async getUser(){return this.get("user","me")},
+  async saveContact(c){await this.put("contacts",c)},
+  async allContacts(){return this.all("contacts")},
+  async saveMsgs(cid,m){await this.put("messages",{id:cid,msgs:m})},
+  async allMsgs(){const a=await this.all("messages");const m={};a.forEach(i=>m[i.id]=i.msgs);return m},
+  async nuke(){await this.clr("user");await this.clr("contacts");await this.clr("messages")}
+};
+
+/* ═══ Crypto ═══ */
+const K={
+  genId(){const c="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let r="";for(let i=0;i<8;i++)r+=c[Math.floor(Math.random()*c.length)];return r},
+  rec(){const w="alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray anchor beacon cipher drift ember frost glyph haven ivory jewel karma lunar maple nexus opal prism quartz ridge solar tide".split(" ");return Array.from({length:12},()=>w[Math.floor(Math.random()*w.length)]).join(" ")},
+  async hp(p){const h=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(p));return btoa(String.fromCharCode(...new Uint8Array(h)))}
+};
+
+/* ═══ P2P Network ═══ */
+const P2P={
+  peer:null,conns:{},cbs:null,myId:null,
+
+  init(pingId,cbs){
+    this.myId=pingId;this.cbs=cbs;
+    this.peer=new Peer("ping-"+pingId,{debug:0});
+
+    this.peer.on("open",()=>{console.log("[P2P] Online as",pingId);if(cbs.onReady)cbs.onReady()});
+
+    this.peer.on("connection",conn=>this._setup(conn));
+
+    this.peer.on("error",err=>{
+      console.log("[P2P] Error:",err.type);
+      if(err.type==="peer-unavailable"){
+        const fid=err.message?.match(/ping-(\w+)/)?.[1];
+        if(fid&&cbs.onPeerOffline)cbs.onPeerOffline(fid);
+      }
+      if(err.type==="unavailable-id"){
+        // ID taken, might be another tab - add random suffix
+        this.peer=new Peer("ping-"+pingId+"-"+Math.random().toString(36).slice(2,5),{debug:0});
+        this.peer.on("open",()=>{if(cbs.onReady)cbs.onReady()});
+        this.peer.on("connection",conn=>this._setup(conn));
+      }
+    });
+
+    this.peer.on("disconnected",()=>{setTimeout(()=>{try{this.peer.reconnect()}catch(e){}},3000)});
+  },
+
+  _setup(conn){
+    const rid=conn.peer.replace(/^ping-/,"").replace(/-\w{3}$/,"");
+    this.conns[rid]=conn;
+    conn.on("open",()=>{if(this.cbs.onPeerOnline)this.cbs.onPeerOnline(rid)});
+    conn.on("data",data=>{if(this.cbs.onMessage)this.cbs.onMessage(rid,data)});
+    conn.on("close",()=>{delete this.conns[rid];if(this.cbs.onPeerOffline)this.cbs.onPeerOffline(rid)});
+  },
+
+  connect(pid){
+    if(this.conns[pid]&&this.conns[pid].open)return;
+    if(!this.peer||this.peer.destroyed)return;
+    const conn=this.peer.connect("ping-"+pid,{reliable:true});
+    this._setup(conn);
+  },
+
+  send(pid,data){
+    const conn=this.conns[pid];
+    if(conn&&conn.open){conn.send(data);return true}
+    // Try fresh connect
+    if(!this.peer||this.peer.destroyed)return false;
+    const nc=this.peer.connect("ping-"+pid,{reliable:true});
+    this._setup(nc);
+    nc.on("open",()=>nc.send(data));
+    return true;
+  },
+
+  destroy(){if(this.peer){this.peer.destroy();this.peer=null}this.conns={}}
+};
+
+/* ═══ UI Components ═══ */
+function Dot({on,sz=8}){return el("span",{style:{width:sz,height:sz,borderRadius:"50%",background:on?C.on:C.off,display:"inline-block",flexShrink:0,boxShadow:on?`0 0 8px ${C.acm}`:""}})}
+function Av({l,sz=42}){return el("div",{style:{width:sz,height:sz,borderRadius:13,background:C.acd,border:`1px solid ${C.acm}`,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:MO,fontWeight:700,fontSize:sz*.38,color:C.ac,flexShrink:0}},l)}
+function Btn({children,onClick,v="p",dis,st={}}){
+  const vs={p:{background:C.ac,color:C.bg},s:{background:C.bg3,color:C.tx,border:`1px solid ${C.bd}`},d:{background:"#FF446618",color:C.dn,border:"1px solid #FF446633"}};
+  return el("button",{onClick,disabled:dis,style:{padding:"14px 24px",borderRadius:12,border:"none",fontSize:15,fontWeight:600,cursor:dis?"not-allowed":"pointer",width:"100%",opacity:dis?.5:1,transition:"all .2s",...vs[v],...st}},children)
+}
+function Inp({value:val,onChange:oc,placeholder:ph,icon:ic,st={}}){
+  return el("div",{style:{position:"relative",width:"100%"}},
+    ic&&el("span",{style:{position:"absolute",left:14,top:"50%",transform:"translateY(-50%)",color:C.t3,fontSize:15}},ic),
+    el("input",{value:val,onChange:e=>oc(e.target.value),placeholder:ph,
+      style:{width:"100%",padding:"13px 16px",paddingLeft:ic?42:16,background:C.bg3,border:`1px solid ${C.bd}`,borderRadius:12,color:C.tx,fontSize:15,outline:"none",boxSizing:"border-box",...st},
+      onFocus:e=>e.target.style.borderColor=C.ac,onBlur:e=>e.target.style.borderColor=C.bd}))
+}
+function Pin({value:val,onChange:oc}){
+  const refs=R([]);const d=val.split("");
+  return el("div",{style:{display:"flex",gap:8,justifyContent:"center"}},
+    Array.from({length:6}).map((_,i)=>
+      el("input",{key:i,ref:r=>refs.current[i]=r,type:"password",inputMode:"numeric",maxLength:1,value:d[i]||"",
+        style:{width:46,height:54,textAlign:"center",fontSize:20,background:C.bg3,border:`1.5px solid ${d[i]?C.ac:C.bd}`,borderRadius:10,color:C.tx,fontFamily:MO,outline:"none"},
+        onChange:e=>{const v=e.target.value.replace(/\D/g,"");const n=[...d];n[i]=v;oc(n.join(""));if(v&&i<5)refs.current[i+1]?.focus()},
+        onKeyDown:e=>{if(e.key==="Backspace"&&!d[i]&&i>0)refs.current[i-1]?.focus()}})))
+}
+function Logo({sz=42}){
+  return el("div",{style:{display:"flex",alignItems:"center",gap:10}},
+    el("div",{style:{width:sz,height:sz,borderRadius:sz*.3,background:`linear-gradient(135deg,${C.ac},#00B894)`,display:"flex",alignItems:"center",justifyContent:"center"}},
+      el("div",{style:{width:sz*.42,height:sz*.42,borderRadius:"50%",background:C.bg}})),
+    el("span",{style:{fontFamily:MO,fontSize:sz*.55,fontWeight:700,color:C.tx,letterSpacing:-1}},"Ping"))
+}
+function NetBanner({status}){
+  if(status==="connected")return null;
+  const c=status==="connecting"?C.wr:C.dn;
+  return el("div",{style:{padding:"6px 16px",background:`${c}15`,borderBottom:`1px solid ${c}33`,display:"flex",alignItems:"center",gap:8,justifyContent:"center"}},
+    el("div",{className:"pulse",style:{width:6,height:6,borderRadius:3,background:c}}),
+    el("span",{style:{fontSize:12,color:c,fontFamily:MO}},status==="connecting"?"Connecting to network...":"Offline"))
+}
+
+/* ═══ Welcome ═══ */
+function Welcome({onReg,onLog}){
+  return el("div",{className:"fade-up",style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",padding:"40px 24px",textAlign:"center"}},
+    el(Logo,{sz:56}),
+    el("p",{style:{color:C.t2,fontSize:15,maxWidth:300,lineHeight:1.7,margin:"20px 0 44px"}},"Peer-to-peer encrypted messaging. No servers. No tracking. Just you and your people."),
+    el("div",{style:{background:C.bg2,borderRadius:16,padding:"16px 20px",marginBottom:40,border:`1px solid ${C.bd}`,maxWidth:340,width:"100%"}},
+      [["🔐","End-to-end encrypted"],["🌐","Real P2P — device to device"],["⚡","Instant delivery"],["👻","No phone number needed"],["💾","Data stored locally only"]].map(([i,t],n)=>
+        el("div",{key:n,style:{display:"flex",alignItems:"center",gap:12,padding:"9px 0",color:C.t2,fontSize:14}},el("span",{style:{fontSize:17}},i),t))),
+    el("div",{style:{display:"flex",flexDirection:"column",gap:12,width:"100%",maxWidth:340}},
+      el(Btn,{onClick:onReg},"Create identity"),
+      el(Btn,{onClick:onLog,v:"s"},"I have a recovery phrase")),
+    el("p",{style:{color:C.t3,fontSize:11,marginTop:28,fontFamily:MO}},"v0.2.0 · real P2P messaging · open source"))
+}
+
+/* ═══ Register ═══ */
+function Register({onDone,onBack}){
+  const[step,sS]=S(0),[un,sU]=S(""),[pin,sP]=S(""),[pc,sPC]=S(""),[myId,sI]=S(""),[rec,sR]=S(""),[cop,sC]=S(false),[gen,sG]=S(false);
+  const go=async()=>{
+    sG(true);await new Promise(r=>setTimeout(r,600));
+    const id=K.genId();const rc=K.rec();const ph=await K.hp(pin);
+    await D.saveUser({username:un,pinHash:ph,pingId:id,recovery:rc,created:Date.now()});
+    sI(id);sR(rc);sG(false);sS(2);
+  };
+  const steps=[
+    el("div",{key:0,className:"fade-up",style:{width:"100%"}},
+      el("h2",{style:{fontSize:22,fontWeight:600,marginBottom:8}},"Choose a username"),
+      el("p",{style:{color:C.t2,fontSize:14,marginBottom:24}},"How your friends will see you."),
+      el(Inp,{value:un,onChange:sU,placeholder:"username",icon:"@"}),
+      el("div",{style:{marginTop:24}},el(Btn,{onClick:()=>sS(1),dis:un.length<2},"Continue"))),
+    el("div",{key:1,className:"fade-up",style:{width:"100%",textAlign:"center"}},
+      el("h2",{style:{fontSize:22,fontWeight:600,marginBottom:8}},"Set a PIN"),
+      el("p",{style:{color:C.t2,fontSize:14,marginBottom:24}},"6 digits to lock your identity."),
+      el(Pin,{value:pin,onChange:sP}),
+      pin.length===6&&el("div",{style:{marginTop:20}},el("p",{style:{color:C.t2,fontSize:14,marginBottom:12}},"Confirm"),el(Pin,{value:pc,onChange:sPC})),
+      pin.length===6&&pc.length===6&&pin!==pc&&el("p",{style:{color:C.dn,fontSize:13,marginTop:8}},"PINs don't match"),
+      el("div",{style:{marginTop:24}},el(Btn,{onClick:go,dis:pin.length<6||pin!==pc||gen},gen?"Generating...":"Generate my identity"))),
+    el("div",{key:2,className:"fade-up",style:{width:"100%",textAlign:"center"}},
+      el("h2",{style:{fontSize:22,fontWeight:600,marginBottom:8}},"You're all set!"),
+      el("div",{style:{marginBottom:20,background:C.bg2,borderRadius:14,padding:20,border:`1px solid ${C.ac}44`}},
+        el("div",{style:{fontSize:11,color:C.t3,fontFamily:MO,marginBottom:6}},"Your Ping ID — share this with friends"),
+        el("div",{style:{fontSize:28,fontFamily:MO,color:C.ac,letterSpacing:4,fontWeight:700}},myId)),
+      el("p",{style:{color:C.dn,fontSize:14,marginBottom:12}},"Recovery phrase — write this down:"),
+      el("div",{style:{background:C.bg3,borderRadius:12,padding:"14px 18px",border:`1px solid ${C.wr}44`,fontFamily:MO,fontSize:13,lineHeight:2.2,color:C.wr,textAlign:"left"}},
+        rec.split(" ").map((w,i)=>el("span",{key:i},el("span",{style:{color:C.t3,fontSize:10,marginRight:4}},i+1),w," "))),
+      el("button",{onClick:()=>{navigator.clipboard?.writeText(rec);sC(true);setTimeout(()=>sC(false),2000)},style:{background:"none",border:"none",color:C.ac,fontFamily:MO,fontSize:12,cursor:"pointer",padding:8,marginTop:4}},cop?"✓ Copied":"Copy"),
+      el("div",{style:{marginTop:16}},el(Btn,{onClick:()=>onDone({username:un,pingId:myId})},"Start messaging")))
+  ];
+  return el("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",height:"100%",padding:"20px 24px 40px"}},
+    el("div",{style:{display:"flex",alignItems:"center",width:"100%",marginBottom:28}},
+      el("button",{onClick:step>0?()=>sS(step-1):onBack,style:{background:"none",border:"none",color:C.t2,fontSize:24,cursor:"pointer",padding:8}},"←"),
+      el("div",{style:{flex:1,display:"flex",gap:6,padding:"0 40px"}},[0,1,2].map(i=>el("div",{key:i,style:{flex:1,height:3,borderRadius:2,background:i<=step?C.ac:C.bg4}})))),
+    el("div",{style:{flex:1,display:"flex",alignItems:"center",width:"100%",maxWidth:380}},steps[step]))
+}
+
+/* ═══ Login ═══ */
+function Login({onDone,onBack,hasAcc}){
+  const[mode,sM]=S(hasAcc?"pin":"rec"),[pin,sP]=S(""),[err,sE]=S(""),[phrase,sPh]=S("");
+  const verify=async v=>{sP(v);if(v.length<6)return;const u=await D.getUser();if(!u){sE("No account");return}const hh=await K.hp(v);if(hh===u.pinHash)setTimeout(()=>onDone(u),300);else{sE("Wrong PIN");setTimeout(()=>{sP("");sE("")},1200)}};
+  return el("div",{className:"fade-up",style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",padding:"40px 24px",position:"relative"}},
+    el("button",{onClick:onBack,style:{position:"absolute",top:20,left:20,background:"none",border:"none",color:C.t2,fontSize:24,cursor:"pointer"}},"←"),
+    mode==="pin"?el("div",{style:{textAlign:"center",width:"100%",maxWidth:380}},
+      el(Logo,{sz:40}),el("p",{style:{color:C.t2,fontSize:14,margin:"20px 0 28px"}},"Enter PIN to unlock"),
+      el(Pin,{value:pin,onChange:verify}),err&&el("p",{style:{color:C.dn,fontSize:13,marginTop:12,fontFamily:MO}},err),
+      el("button",{onClick:()=>sM("rec"),style:{background:"none",border:"none",color:C.ac,fontSize:13,cursor:"pointer",marginTop:24,fontFamily:MO}},"Use recovery phrase")):
+    el("div",{style:{width:"100%",maxWidth:380}},
+      el("h2",{style:{fontSize:22,fontWeight:600,marginBottom:8}},"Recover account"),
+      el("textarea",{value:phrase,onChange:e=>sPh(e.target.value),placeholder:"Enter 12-word phrase...",rows:4,style:{width:"100%",padding:16,background:C.bg3,border:`1px solid ${C.bd}`,borderRadius:12,color:C.tx,fontSize:14,fontFamily:MO,resize:"none",outline:"none",boxSizing:"border-box",lineHeight:1.8,marginTop:16}}),
+      el("div",{style:{marginTop:20}},el(Btn,{onClick:async()=>{const id=K.genId();const u={username:"Recovered",pingId:id,recovery:phrase,pinHash:await K.hp("000000"),created:Date.now()};await D.saveUser(u);onDone(u)},dis:phrase.split(" ").filter(Boolean).length<12},"Restore")),
+      hasAcc&&el("button",{onClick:()=>sM("pin"),style:{background:"none",border:"none",color:C.ac,fontSize:13,cursor:"pointer",display:"block",margin:"16px auto 0",fontFamily:MO}},"Use PIN")))
+}
+
+/* ═══ Add Friend ═══ */
+function AddModal({onClose,onAdd,myId}){
+  const[tab,sT]=S("me"),[fid,sF]=S(""),[fn,sFN]=S(""),[cop,sC]=S(false);
+  return el("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:100},onClick:onClose},
+    el("div",{className:"fade-up",onClick:e=>e.stopPropagation(),style:{background:C.bg2,borderRadius:"20px 20px 0 0",width:"100%",maxWidth:480,padding:"8px 24px 36px",maxHeight:"85dvh",overflow:"auto",border:`1px solid ${C.bd}`,borderBottom:"none"}},
+      el("div",{style:{width:36,height:4,background:C.bg4,borderRadius:2,margin:"8px auto 20px"}}),
+      el("div",{style:{display:"flex",background:C.bg3,borderRadius:10,padding:3,marginBottom:24}},
+        [["me","My ID"],["add","Add friend"]].map(([k,lb])=>el("button",{key:k,onClick:()=>sT(k),style:{flex:1,padding:"10px 0",border:"none",borderRadius:8,fontSize:14,fontWeight:500,cursor:"pointer",background:tab===k?C.bg:"transparent",color:tab===k?C.tx:C.t3}},lb))),
+      tab==="me"?
+        el("div",{style:{textAlign:"center"}},
+          el("p",{style:{color:C.t2,fontSize:14,marginBottom:20}},"Share your Ping ID with friends"),
+          el("div",{style:{background:C.bg3,borderRadius:14,padding:24,border:`1px solid ${C.ac}44`,marginBottom:16}},
+            el("div",{style:{fontSize:32,fontFamily:MO,color:C.ac,letterSpacing:5,fontWeight:700}},myId)),
+          el("button",{onClick:()=>{navigator.clipboard?.writeText(myId);sC(true);setTimeout(()=>sC(false),2000)},style:{width:"100%",background:C.acd,border:`1px solid ${C.ac}33`,color:C.ac,padding:"12px",borderRadius:10,fontSize:13,fontFamily:MO,cursor:"pointer",fontWeight:600}},cop?"✓ Copied!":"Copy Ping ID"),
+          el("div",{style:{marginTop:20,padding:14,background:C.bg3,borderRadius:12,border:`1px solid ${C.bd}`}},
+            el("p",{style:{fontSize:13,color:C.t2,margin:0}},"Both people need each other's ID. When both are online, Ping connects you directly — peer to peer."))):
+        el("div",null,
+          el("p",{style:{color:C.t2,fontSize:14,marginBottom:20}},"Enter your friend's Ping ID"),
+          el("div",{style:{display:"flex",flexDirection:"column",gap:12}},
+            el(Inp,{value:fid,onChange:sF,placeholder:"e.g. QVRT7X2K",icon:"#",st:{fontFamily:MO,letterSpacing:2,textTransform:"uppercase"}}),
+            el(Inp,{value:fn,onChange:sFN,placeholder:"Name",icon:"@"})),
+          el("div",{style:{marginTop:20}},el(Btn,{onClick:()=>{onAdd({id:fid.toUpperCase().trim(),name:fn.trim(),av:fn.trim()[0]?.toUpperCase()||"?",online:false,lastMsg:"Connecting...",lastTime:"now",unread:0});onClose()},dis:fid.trim().length<4||!fn.trim()},"Add friend")))))
+}
+
+/* ═══ Settings ═══ */
+function Settings({onClose,user,onLock,onNuke,net}){
+  return el("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:100},onClick:onClose},
+    el("div",{className:"fade-up",onClick:e=>e.stopPropagation(),style:{background:C.bg2,borderRadius:"20px 20px 0 0",width:"100%",maxWidth:480,padding:"8px 24px 36px",border:`1px solid ${C.bd}`,borderBottom:"none"}},
+      el("div",{style:{width:36,height:4,background:C.bg4,borderRadius:2,margin:"8px auto 20px"}}),
+      el("div",{style:{display:"flex",alignItems:"center",gap:12,marginBottom:20}},el(Logo,{sz:28}),el("span",{style:{fontSize:18,fontWeight:600}},"Settings")),
+      [["Username",user?.username||"—"],["Ping ID",user?.pingId||"—"],["Network",net==="connected"?"Connected":"Connecting..."],["Storage","Local only · no servers"]].map(([lb,vl],i)=>
+        el("div",{key:i,style:{background:C.bg3,borderRadius:12,padding:"12px 16px",border:`1px solid ${C.bd}`,marginBottom:10}},
+          el("div",{style:{fontSize:11,color:C.t3,fontFamily:MO,marginBottom:3}},lb),
+          el("div",{style:{fontSize:14,color:lb==="Ping ID"||lb==="Network"&&net==="connected"?C.ac:C.t2,fontFamily:lb==="Ping ID"?MO:"inherit"}},vl))),
+      el("div",{style:{display:"flex",flexDirection:"column",gap:10,marginTop:16}},
+        el(Btn,{onClick:onLock,v:"s"},"Lock app"),
+        el(Btn,{onClick:async()=>{if(confirm("Delete everything?")){P2P.destroy();await D.nuke();onNuke()}},v:"d"},"Delete account"))))
+}
+
+/* ═══ Chat List ═══ */
+function ChatList({contacts:cts,onSelect,onAdd,myId,onSettings,net}){
+  const[q,sQ]=S("");const fl=cts.filter(c=>c.name.toLowerCase().includes(q.toLowerCase()));
+  return el("div",{style:{display:"flex",flexDirection:"column",height:"100%",background:C.bg}},
+    el(NetBanner,{status:net}),
+    el("div",{style:{padding:"14px 20px 12px",borderBottom:`1px solid ${C.bd}`}},
+      el("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}},
+        el(Logo,{sz:32}),
+        el("div",{style:{display:"flex",alignItems:"center",gap:8}},
+          el("div",{style:{background:C.bg3,borderRadius:8,padding:"4px 10px",fontFamily:MO,fontSize:11,color:C.t3,border:`1px solid ${C.bd}`}},myId),
+          el(Dot,{on:net==="connected",sz:8}))),
+      el(Inp,{value:q,onChange:sQ,placeholder:"Search",icon:"⌕"})),
+    el("div",{style:{flex:1,overflow:"auto"}},
+      fl.map(c=>el("div",{key:c.id,onClick:()=>onSelect(c),style:{display:"flex",alignItems:"center",gap:14,padding:"13px 20px",cursor:"pointer",borderBottom:`1px solid ${C.bd}11`},
+        onMouseEnter:e=>e.currentTarget.style.background=C.bg2,onMouseLeave:e=>e.currentTarget.style.background="transparent"},
+        el("div",{style:{position:"relative"}},el(Av,{l:c.av||c.name[0]}),el("div",{style:{position:"absolute",bottom:-2,right:-2}},el(Dot,{on:c.online,sz:10}))),
+        el("div",{style:{flex:1,minWidth:0}},
+          el("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:3}},el("span",{style:{fontWeight:600,fontSize:15}},c.name),el("span",{style:{fontSize:11,color:C.t3,fontFamily:MO}},c.lastTime)),
+          el("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+            el("span",{style:{fontSize:13,color:C.t2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"82%"}},c.lastMsg),
+            c.unread>0&&el("span",{style:{background:C.ac,color:C.bg,fontSize:10,fontWeight:700,minWidth:20,height:20,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:MO,padding:"0 5px"}},c.unread))))),
+      el("div",{onClick:onAdd,style:{display:"flex",alignItems:"center",gap:14,padding:"13px 20px",cursor:"pointer"},
+        onMouseEnter:e=>e.currentTarget.style.background=C.bg2,onMouseLeave:e=>e.currentTarget.style.background="transparent"},
+        el("div",{style:{width:42,height:42,borderRadius:13,border:`1.5px dashed ${C.ac}55`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,color:C.ac}},"+"),
+        el("span",{style:{color:C.ac,fontSize:14,fontWeight:500}},"Add a friend"))),
+    el("div",{style:{padding:"10px 20px",borderTop:`1px solid ${C.bd}`,display:"flex",justifyContent:"space-around"}},
+      [["💬","Chats",true,null],["⚙️","Settings",false,onSettings]].map(([ic,lb,ac,fn])=>
+        el("div",{key:lb,onClick:fn,style:{textAlign:"center",cursor:fn?"pointer":"default",opacity:ac?1:.5,padding:"4px 16px"}},
+          el("div",{style:{fontSize:18}},ic),el("div",{style:{fontSize:10,color:ac?C.ac:C.t3,marginTop:2,fontFamily:MO}},lb)))))
+}
+
+/* ═══ Chat View ═══ */
+function ChatView({contact:ct,messages:msgs,onBack,onSend,desk}){
+  const[tx,sT]=S("");const sr=R(null),ir=R(null);
+  E(()=>{sr.current?.scrollTo({top:sr.current.scrollHeight,behavior:"smooth"})},[msgs]);
+  const send=()=>{if(!tx.trim())return;onSend(tx.trim());sT("");ir.current?.focus()};
+  return el("div",{style:{display:"flex",flexDirection:"column",height:"100%",background:C.bg}},
+    el("div",{style:{display:"flex",alignItems:"center",gap:12,padding:"10px 16px",borderBottom:`1px solid ${C.bd}`,background:C.bg2}},
+      !desk&&el("button",{onClick:onBack,style:{background:"none",border:"none",color:C.t2,fontSize:22,cursor:"pointer",padding:"4px 6px 4px 0"}},"←"),
+      el(Av,{l:ct.av||ct.name[0],sz:36}),
+      el("div",{style:{flex:1}},el("div",{style:{fontWeight:600,fontSize:15}},ct.name),
+        el("div",{style:{display:"flex",alignItems:"center",gap:6,fontSize:12,color:C.t3}},el(Dot,{on:ct.online,sz:6}),ct.online?"Online · P2P direct":"Offline")),
+      el("div",{style:{background:C.bg3,borderRadius:7,padding:"3px 8px",fontFamily:MO,fontSize:10,color:C.t3,border:`1px solid ${C.bd}`}},ct.id)),
+    el("div",{ref:sr,style:{flex:1,overflow:"auto",padding:"14px 16px"}},
+      el("div",{style:{textAlign:"center",marginBottom:18,padding:"8px 14px",background:C.acd,borderRadius:10}},
+        el("span",{style:{fontSize:11,color:C.ac,fontFamily:MO}},ct.online?"🟢 Connected — messages go direct P2P":"⏳ Peer offline — messages send when they connect")),
+      msgs.map((m,i)=>{const me=m.from==="me";
+        return el("div",{key:i,style:{display:"flex",justifyContent:me?"flex-end":"flex-start",marginBottom:5}},
+          el("div",{style:{maxWidth:"78%",padding:"10px 14px",borderRadius:16,borderBottomRightRadius:me?4:16,borderBottomLeftRadius:me?16:4,background:me?C.ac:C.bg3,color:me?C.bg:C.tx,border:me?"none":`1px solid ${C.bd}`}},
+            el("div",{style:{fontSize:14,lineHeight:1.5}},m.text),
+            el("div",{style:{fontSize:10,marginTop:3,textAlign:"right",color:me?"rgba(0,0,0,.45)":C.t3,fontFamily:MO}},m.time)))})),
+    el("div",{className:"safe-b",style:{padding:"10px 14px",borderTop:`1px solid ${C.bd}`,display:"flex",gap:10,alignItems:"flex-end",background:C.bg2}},
+      el("div",{style:{flex:1}},
+        el("input",{ref:ir,value:tx,onChange:e=>sT(e.target.value),onKeyDown:e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}},placeholder:"Message...",
+          style:{width:"100%",padding:"11px 16px",background:C.bg3,border:`1px solid ${C.bd}`,borderRadius:24,color:C.tx,fontSize:15,outline:"none",boxSizing:"border-box"}})),
+      el("button",{onClick:send,style:{width:42,height:42,borderRadius:21,border:"none",background:tx.trim()?C.ac:C.bg4,color:tx.trim()?C.bg:C.t3,fontSize:18,cursor:tx.trim()?"pointer":"default",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}},"↑")))
+}
+
+function Empty(){
+  return el("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",color:C.t3,textAlign:"center",padding:40}},
+    el("div",{style:{width:60,height:60,borderRadius:20,background:C.acd,display:"flex",alignItems:"center",justifyContent:"center",marginBottom:16}},
+      el("div",{style:{width:24,height:24,borderRadius:"50%",border:`3px solid ${C.ac}`,opacity:.4}})),
+    el("p",{style:{fontSize:15,fontWeight:500,color:C.t2}},"Select a conversation"))
+}
+
+/* ═══ App ═══ */
+function Loading(){
+  return el("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",gap:16}},
+    el(Logo,{sz:48}),el("div",{className:"pulse",style:{fontSize:13,color:C.t3,fontFamily:MO}},"Loading..."))
+}
+
+function App(){
+  const[scr,sS]=S("load"),[user,sU]=S(null),[cts,sC]=S([]),[msgs,sM]=S({}),[act,sA]=S(null),[add,sAd]=S(false),[set,sSt]=S(false),[dk,sDk]=S(window.innerWidth>=768),[net,sN]=S("connecting");
+  const actRef=R(null),ctsRef=R([]),msgsRef=R({});
+  E(()=>{actRef.current=act},[act]);E(()=>{ctsRef.current=cts},[cts]);E(()=>{msgsRef.current=msgs},[msgs]);
+  E(()=>{const f=()=>sDk(window.innerWidth>=768);window.addEventListener("resize",f);return()=>window.removeEventListener("resize",f)},[]);
+
+  const initP2P=CB(pid=>{
+    P2P.init(pid,{
+      onReady:()=>{sN("connected");ctsRef.current.forEach(c=>P2P.connect(c.id))},
+      onMessage:(fid,data)=>{
+        const time=new Date().toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});
+        const msg={from:"them",text:data.text||String(data),time};
+        const cur=msgsRef.current;const upd=[...(cur[fid]||[]),msg];const nm={...cur,[fid]:upd};
+        sM(nm);msgsRef.current=nm;D.saveMsgs(fid,upd);
+        const isAct=actRef.current&&actRef.current.id===fid;
+        sC(p=>{const u=p.map(c=>c.id===fid?{...c,lastMsg:msg.text,lastTime:"now",online:true,unread:isAct?0:(c.unread||0)+1}:c);const uc=u.find(c=>c.id===fid);if(uc)D.saveContact(uc);return u})},
+      onPeerOnline:pid=>{sC(p=>{const u=p.map(c=>c.id===pid?{...c,online:true}:c);const uc=u.find(c=>c.id===pid);if(uc)D.saveContact(uc);return u})},
+      onPeerOffline:pid=>{sC(p=>{const u=p.map(c=>c.id===pid?{...c,online:false}:c);const uc=u.find(c=>c.id===pid);if(uc)D.saveContact(uc);return u})}
+    })
+  },[]);
+
+  E(()=>{(async()=>{
+    try{const u=await D.getUser();const c=await D.allContacts();const m=await D.allMsgs();
+      if(u&&u.pingId){sU(u);sC(c);sM(m);ctsRef.current=c;msgsRef.current=m;sS("pin")}
+      else sS("welcome")}catch(e){sS("welcome")}
+  })()},[]);
+
+  const myId=user?.pingId||"--------";
+
+  const doSend=t=>{
+    if(!act)return;const time=new Date().toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});
+    P2P.send(act.id,{text:t,time,from:myId});
+    sM(p=>{const u={...p,[act.id]:[...(p[act.id]||[]),{from:"me",text:t,time}]};msgsRef.current=u;D.saveMsgs(act.id,u[act.id]);return u});
+    sC(p=>{const u=p.map(c=>c.id===act.id?{...c,lastMsg:t,lastTime:"now"}:c);const uc=u.find(c=>c.id===act.id);if(uc)D.saveContact(uc);return u})};
+
+  const doAdd=f=>{sC(p=>{D.saveContact(f);ctsRef.current=[...p,f];return[...p,f]});sM(p=>{D.saveMsgs(f.id,[]);return{...p,[f.id]:[]}});if(P2P.peer)P2P.connect(f.id)};
+  const doSel=c=>{sA(c);sC(p=>{const u=p.map(x=>x.id===c.id?{...x,unread:0}:x);const uc=u.find(x=>x.id===c.id);if(uc)D.saveContact(uc);return u});if(P2P.peer)P2P.connect(c.id)};
+  const enterMain=u=>{sU(u);sS("main");sN("connecting");initP2P(u.pingId)};
+
+  const sty={background:C.bg,color:C.tx,height:"100dvh",width:"100%",display:"flex",flexDirection:"column",overflow:"hidden",maxWidth:1200,margin:"0 auto",position:"relative"};
+
+  if(scr==="load")return el("div",{style:sty},el(Loading));
+  if(scr==="welcome")return el("div",{style:sty},el(Welcome,{onReg:()=>sS("reg"),onLog:()=>sS("login")}));
+  if(scr==="reg")return el("div",{style:sty},el(Register,{onBack:()=>sS("welcome"),onDone:enterMain}));
+  if(scr==="login"||scr==="pin")return el("div",{style:sty},el(Login,{onBack:()=>sS("welcome"),hasAcc:scr==="pin",onDone:enterMain}));
+
+  const modals=el(React.Fragment,null,
+    add&&el(AddModal,{onClose:()=>sAd(false),onAdd:doAdd,myId}),
+    set&&el(Settings,{onClose:()=>sSt(false),user,net,onLock:()=>{P2P.destroy();sS("pin");sSt(false);sA(null);sN("connecting")},onNuke:()=>{P2P.destroy();sS("welcome");sSt(false);sU(null);sC([]);sM({});sA(null)}}));
+
+  if(!dk)return el("div",{style:sty},!act?el(ChatList,{contacts:cts,onSelect:doSel,onAdd:()=>sAd(true),myId,onSettings:()=>sSt(true),net}):el(ChatView,{contact:act,messages:msgs[act.id]||[],onBack:()=>sA(null),onSend:doSend,desk:false}),modals);
+
+  return el("div",{style:sty},
+    el("div",{style:{display:"flex",flex:1,overflow:"hidden"}},
+      el("div",{style:{width:360,minWidth:360,borderRight:`1px solid ${C.bd}`,height:"100%"}},el(ChatList,{contacts:cts,onSelect:doSel,onAdd:()=>sAd(true),myId,onSettings:()=>sSt(true),net})),
+      el("div",{style:{flex:1,height:"100%"}},act?el(ChatView,{contact:act,messages:msgs[act.id]||[],onBack:()=>sA(null),onSend:doSend,desk:true}):el(Empty))),modals)
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(el(App));
+</script>
+</body>
+</html>
